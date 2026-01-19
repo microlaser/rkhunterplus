@@ -18,4 +18,3 @@ which is licensed under GPL v2.0, copyright Michael Boelen.
 
 ## Legal Notice
 This tool is designed to detect constitutional violations of the Fourth Amendment
-as documented in [your case]. Evidence gathered has been shared with the EFF.
