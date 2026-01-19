@@ -1,0 +1,271 @@
+#!/bin/bash
+# rkhunter MITM Detection Integration Script
+# This script integrates the MITM detection checks into rkhunter
+
+set -e
+
+RKHUNTER_DIR="/usr/local/lib/rkhunter/scripts"
+CUSTOM_CHECKS_DIR="$RKHUNTER_DIR/custom_checks"
+RKHUNTER_CONF="/etc/rkhunter.conf"
+
+echo "=== Installing rkhunter MITM Detection Extension ==="
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: This script must be run as root"
+    exit 1
+fi
+
+# Check if rkhunter is installed
+if ! command -v rkhunter &> /dev/null; then
+    echo "ERROR: rkhunter is not installed"
+    echo "Install with: apt install rkhunter  (Debian/Ubuntu)"
+    echo "         or:  yum install rkhunter  (RHEL/CentOS)"
+    exit 1
+fi
+
+# Create custom checks directory
+echo "Creating custom checks directory..."
+mkdir -p "$CUSTOM_CHECKS_DIR"
+
+# Copy the MITM detection script
+echo "Installing MITM detection script..."
+cat > "$CUSTOM_CHECKS_DIR/check_mitm.sh" << 'MITM_SCRIPT'
+#!/bin/bash
+# MITM/Surveillance Detection for rkhunter
+# Checks for evidence of ISP-level traffic interception
+
+MITM_FOUND=0
+
+# Check for NFQUEUE
+if nft list ruleset 2>/dev/null | grep -qi "queue" || \
+   iptables -t mangle -L 2>/dev/null | grep -qi "nfqueue"; then
+    echo "Warning: NFQUEUE packet diversion detected"
+    MITM_FOUND=1
+fi
+
+# Check for suspicious IP blocks
+if iptables -L OUTPUT -n 2>/dev/null | grep -E "66.254.114.0|151.101.0.0" &>/dev/null; then
+    echo "Warning: Content filtering rules detected"
+    MITM_FOUND=1
+fi
+
+# Check for DNS interception
+if nft list ruleset 2>/dev/null | grep "sport 53" | grep -qi "queue"; then
+    echo "Warning: DNS interception detected"
+    MITM_FOUND=1
+fi
+
+# Check for VPN replay attacks
+if grep -q "AEAD Decrypt error.*replay" /var/log/openvpn.log /var/log/syslog 2>/dev/null; then
+    REPLAY_COUNT=$(grep -c "AEAD Decrypt error.*replay" /var/log/openvpn.log /var/log/syslog 2>/dev/null || echo 0)
+    if [ "$REPLAY_COUNT" -gt 10 ]; then
+        echo "Warning: VPN packet replay attacks detected ($REPLAY_COUNT instances)"
+        MITM_FOUND=1
+    fi
+fi
+
+# Check for persistent bridges
+if ip link show type bridge 2>/dev/null | grep -q "docker0"; then
+    if ! systemctl is-active docker &>/dev/null; then
+        echo "Warning: docker0 bridge exists without Docker running"
+        MITM_FOUND=1
+    fi
+fi
+
+# Check for suspicious kernel modules
+for mod in nfnetlink_queue nft_queue; do
+    if lsmod | grep -q "^$mod"; then
+        echo "Warning: Surveillance kernel module loaded: $mod"
+        MITM_FOUND=1
+    fi
+done
+
+exit $MITM_FOUND
+MITM_SCRIPT
+
+chmod +x "$CUSTOM_CHECKS_DIR/check_mitm.sh"
+
+# Add custom check to rkhunter configuration
+echo "Updating rkhunter configuration..."
+
+if ! grep -q "SCRIPTDIR=" "$RKHUNTER_CONF"; then
+    echo "" >> "$RKHUNTER_CONF"
+    echo "# Custom MITM detection checks" >> "$RKHUNTER_CONF"
+    echo "SCRIPTDIR=$CUSTOM_CHECKS_DIR" >> "$RKHUNTER_CONF"
+fi
+
+# Create additional whitelist entries if needed
+if ! grep -q "ALLOWDEVFILE=/dev/shm/sem.onirvz42" "$RKHUNTER_CONF"; then
+    cat >> "$RKHUNTER_CONF" << 'EOF'
+
+# Whitelist for known benign but suspicious files
+# Adjust these based on your system
+#ALLOWDEVFILE=/dev/shm/sem.*
+
+# Enable custom checks
+DISABLE_TESTS=none
+EOF
+fi
+
+# Create custom rkhunter database entries for surveillance artifacts
+echo "Creating surveillance artifact database..."
+cat > "$CUSTOM_CHECKS_DIR/surveillance_signatures.dat" << 'SIGFILE'
+# Surveillance Infrastructure Signatures
+# Add file paths and signatures that indicate MITM infrastructure
+
+# Suspicious processes
+PROC:opensnitchd
+PROC:snort
+PROC:suricata
+
+# Suspicious network configurations
+FILE:/etc/nftables.conf:queue
+FILE:/etc/iptables/rules.v4:NFQUEUE
+FILE:/etc/iptables/rules.v6:NFQUEUE
+
+# Suspicious modules
+KMOD:nfnetlink_queue
+KMOD:nft_queue
+KMOD:xt_NFQUEUE
+
+# Blocked IP ranges (content filtering)
+IPTABLES:66.254.114.0/23
+IPTABLES:151.101.0.0/16
+IPTABLES:199.232.0.0/16
+SIGFILE
+
+# Create wrapper script for rkhunter with MITM checks
+echo "Creating enhanced rkhunter wrapper..."
+cat > "/usr/local/bin/rkhunter-mitm" << 'WRAPPER'
+#!/bin/bash
+# Enhanced rkhunter with MITM detection
+
+echo "=== Running standard rkhunter checks ==="
+rkhunter --check --skip-keypress "$@"
+RKH_EXIT=$?
+
+echo ""
+echo "=== Running MITM detection checks ==="
+/usr/local/lib/rkhunter/scripts/custom_checks/check_mitm.sh
+MITM_EXIT=$?
+
+# Run full MITM scan
+if [ -f "/usr/local/bin/rkhunter_mitm_check.sh" ]; then
+    echo ""
+    echo "=== Running comprehensive MITM scan ==="
+    /usr/local/bin/rkhunter_mitm_check.sh
+fi
+
+# Combine exit codes
+if [ $RKH_EXIT -ne 0 ] || [ $MITM_EXIT -ne 0 ]; then
+    echo ""
+    echo "WARNING: Security issues detected!"
+    echo "Check logs for details."
+    exit 1
+fi
+
+exit 0
+WRAPPER
+
+chmod +x "/usr/local/bin/rkhunter-mitm"
+
+# Create cron job for automated scanning
+echo "Setting up automated MITM detection..."
+cat > "/etc/cron.daily/rkhunter-mitm" << 'CRONJOB'
+#!/bin/bash
+# Daily MITM detection scan
+
+OUTPUT=$(/usr/local/bin/rkhunter-mitm --cronjob --report-warnings-only 2>&1)
+
+if [ -n "$OUTPUT" ]; then
+    echo "$OUTPUT" | mail -s "[rkhunter-MITM] Warnings on $(hostname)" root
+fi
+CRONJOB
+
+chmod +x "/etc/cron.daily/rkhunter-mitm"
+
+# Create systemd service for real-time monitoring (optional)
+echo "Creating systemd service for real-time monitoring..."
+cat > "/etc/systemd/system/rkhunter-mitm-monitor.service" << 'SERVICE'
+[Unit]
+Description=Real-time MITM Detection Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rkhunter_mitm_monitor.sh
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+# Create the monitoring script
+cat > "/usr/local/bin/rkhunter_mitm_monitor.sh" << 'MONITOR'
+#!/bin/bash
+# Real-time MITM detection monitor
+# Watches for suspicious network changes
+
+LOG="/var/log/rkhunter_mitm_realtime.log"
+
+log_alert() {
+    echo "[$(date)] ALERT: $1" | tee -a "$LOG"
+    # Send to syslog
+    logger -t rkhunter-mitm "ALERT: $1"
+}
+
+# Get baseline
+BASELINE_NFQUEUE=$(nft list ruleset 2>/dev/null | grep -c "queue")
+BASELINE_BLOCKS=$(iptables -L OUTPUT -n 2>/dev/null | grep -c "REJECT\|DROP")
+
+echo "[$(date)] MITM Monitor started" | tee -a "$LOG"
+echo "Baseline NFQUEUE rules: $BASELINE_NFQUEUE" | tee -a "$LOG"
+echo "Baseline block rules: $BASELINE_BLOCKS" | tee -a "$LOG"
+
+while true; do
+    sleep 60
+    
+    # Check for new NFQUEUE rules
+    CURRENT_NFQUEUE=$(nft list ruleset 2>/dev/null | grep -c "queue")
+    if [ "$CURRENT_NFQUEUE" -gt "$BASELINE_NFQUEUE" ]; then
+        log_alert "New NFQUEUE rules detected! Was: $BASELINE_NFQUEUE, Now: $CURRENT_NFQUEUE"
+        BASELINE_NFQUEUE=$CURRENT_NFQUEUE
+    fi
+    
+    # Check for new blocking rules
+    CURRENT_BLOCKS=$(iptables -L OUTPUT -n 2>/dev/null | grep -c "REJECT\|DROP")
+    if [ "$CURRENT_BLOCKS" -gt "$BASELINE_BLOCKS" ]; then
+        log_alert "New blocking rules detected! Was: $BASELINE_BLOCKS, Now: $CURRENT_BLOCKS"
+        BASELINE_BLOCKS=$CURRENT_BLOCKS
+    fi
+    
+    # Check for new suspicious modules
+    if lsmod | grep -q "nfnetlink_queue"; then
+        if ! grep -q "nfnetlink_queue" "$LOG" 2>/dev/null; then
+            log_alert "NFQUEUE kernel module loaded!"
+        fi
+    fi
+done
+MONITOR
+
+chmod +x "/usr/local/bin/rkhunter_mitm_monitor.sh"
+
+echo ""
+echo "=== Installation Complete ==="
+echo ""
+echo "Installed components:"
+echo "  - Custom MITM detection script: $CUSTOM_CHECKS_DIR/check_mitm.sh"
+echo "  - Enhanced rkhunter wrapper: /usr/local/bin/rkhunter-mitm"
+echo "  - Daily scan cron job: /etc/cron.daily/rkhunter-mitm"
+echo "  - Real-time monitor service: rkhunter-mitm-monitor.service"
+echo ""
+echo "Usage:"
+echo "  Run manual scan:        /usr/local/bin/rkhunter-mitm"
+echo "  Enable real-time monitor: systemctl enable --now rkhunter-mitm-monitor"
+echo "  View monitor logs:      tail -f /var/log/rkhunter_mitm_realtime.log"
+echo ""
+echo "IMPORTANT: Update rkhunter database after clean installation:"
+echo "  rkhunter --propupd"
+echo ""
